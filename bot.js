@@ -1,3 +1,4 @@
+require("dotenv").config();
 const TelegramBot = require("node-telegram-bot-api");
 const { createClient } = require("@supabase/supabase-js");
 const cron = require("node-cron");
@@ -11,6 +12,12 @@ const CASHFREE_APP_ID = process.env.CASHFREE_APP_ID || "";
 const CASHFREE_SECRET_KEY = process.env.CASHFREE_SECRET_KEY || "";
 const CASHFREE_ENV = process.env.CASHFREE_ENV || "TEST";
 const PORT = process.env.PORT || 3000;
+const ADMIN_CHAT_IDS = new Set(
+  (process.env.ADMIN_CHAT_IDS || "")
+    .split(",")
+    .map((id) => id.trim())
+    .filter(Boolean)
+);
 
 const CASHFREE_BASE = CASHFREE_ENV === "PROD"
   ? "https://api.cashfree.com/pg"
@@ -21,8 +28,25 @@ if (!BOT_TOKEN) { console.error("FATAL: TELEGRAM_BOT_TOKEN missing!"); process.e
 console.log("Trade Infinity Bot v4 starting...");
 console.log("Cashfree:", CASHFREE_APP_ID ? "configured (" + CASHFREE_ENV + ")" : "NOT configured");
 
-const bot = new TelegramBot(BOT_TOKEN, { polling: true });
-console.log("Telegram bot connected!");
+const bot = new TelegramBot(BOT_TOKEN, { polling: false });
+
+async function startTelegramPolling() {
+  try {
+    await bot.deleteWebHook({ drop_pending_updates: false });
+    console.log("Old Telegram webhook cleared.");
+  } catch (err) {
+    console.log("Webhook clear skipped:", err.message);
+  }
+
+  try {
+    await bot.startPolling({ restart: true });
+    console.log("Telegram polling started!");
+  } catch (err) {
+    console.log("Telegram polling failed:", err.message);
+  }
+}
+
+startTelegramPolling();
 
 let supabase = null, dbOk = false;
 if (SUPABASE_URL && SUPABASE_KEY && SUPABASE_URL.startsWith("http")) {
@@ -43,7 +67,14 @@ app.use((req, res, next) => {
   next();
 });
 
-app.get("/", (req, res) => res.json({ status: "running", version: "v4", db: dbOk, cashfree: !!CASHFREE_APP_ID }));
+app.get("/", (req, res) => res.json({
+  status: "running",
+  version: "v4",
+  db: dbOk,
+  cashfree: !!CASHFREE_APP_ID,
+  telegram: "polling",
+  adminChatIdsConfigured: ADMIN_CHAT_IDS.size > 0,
+}));
 
 app.listen(PORT, () => {
   console.log("Server on port " + PORT);
@@ -57,6 +88,45 @@ process.on("unhandledRejection", (err) => console.log("Unhandled:", err));
 
 async function safeSend(chatId, text, opts = {}) {
   try { await bot.sendMessage(chatId, text, opts); return true; } catch (e) { console.log("Send fail:", e.message); return false; }
+}
+
+function isAdminChat(chatId) {
+  return ADMIN_CHAT_IDS.has(String(chatId));
+}
+
+function parseEntryPrice(value) {
+  const price = Number(String(value || "").replace(/,/g, ""));
+  return Number.isFinite(price) && price > 0 ? price : null;
+}
+
+async function createAndSendManualAlert(stock, entryPrice) {
+  const ad = {
+    stock_name: stock.toUpperCase(),
+    entry_price: entryPrice,
+    target_price: Math.round(entryPrice * 1.3 * 100) / 100,
+    sl_price: Math.round(entryPrice * 0.85 * 100) / 100,
+  };
+
+  let alertId = null;
+  if (dbOk) {
+    const { data } = await supabase
+      .from("alerts_log")
+      .insert({ ...ad, strategy: "52-Week High Breakout" })
+      .select("id")
+      .single();
+    alertId = data?.id || null;
+  }
+
+  const notified = await sendAlertToUsers(ad);
+
+  if (dbOk && alertId) {
+    await supabase
+      .from("alerts_log")
+      .update({ users_notified: notified })
+      .eq("id", alertId);
+  }
+
+  return { ad, notified };
 }
 
 // ============================================
@@ -79,6 +149,66 @@ bot.onText(/\/test/, async (msg) => {
   let ds = "Not configured";
   if (dbOk) { try { const{error}=await supabase.from("users").select("id").limit(1); ds=error?"Error":"Connected!"; } catch(e){ ds="Error"; } }
   await safeSend(msg.chat.id, "🔧 *Status*\n🤖 Bot: Running\n🗄️ DB: "+ds+"\n💳 Cashfree: "+(CASHFREE_APP_ID?"Configured":"Not set")+"\n⏰ "+new Date().toLocaleString("en-IN",{timeZone:"Asia/Kolkata"}), {parse_mode:"Markdown"});
+});
+
+bot.onText(/\/myid/, async (msg) => {
+  await safeSend(msg.chat.id, "Your Telegram chat ID is: `" + msg.chat.id + "`", { parse_mode: "Markdown" });
+});
+
+bot.onText(/\/adminhelp/, async (msg) => {
+  const usage = isAdminChat(msg.chat.id)
+    ? "/alert RELIANCE 2950"
+    : "/alert ADMIN_KEY RELIANCE 2950";
+  await safeSend(msg.chat.id,
+    "Admin Commands\n\n" +
+    usage + " - send a manual strategy alert\n" +
+    "/myid - get your chat ID for ADMIN_CHAT_IDS\n\n" +
+    "Manual alerts go only to active trial/pro users.");
+});
+
+bot.onText(/\/alert(?:\s+(.+))?/, async (msg, match) => {
+  const chatId = msg.chat.id;
+  const parts = (match[1] || "").trim().split(/\s+/).filter(Boolean);
+
+  let key = null;
+  let stock = null;
+  let entry = null;
+
+  if (isAdminChat(chatId) && parts.length >= 2) {
+    [stock, entry] = parts;
+  } else if (parts.length >= 3) {
+    [key, stock, entry] = parts;
+  }
+
+  if (!stock || !entry) {
+    await safeSend(chatId, "Usage:\n" + (isAdminChat(chatId) ? "/alert RELIANCE 2950" : "/alert ADMIN_KEY RELIANCE 2950"));
+    return;
+  }
+
+  if (!isAdminChat(chatId) && key !== ADMIN_KEY) {
+    await safeSend(chatId, "Wrong admin key.");
+    return;
+  }
+
+  const entryPrice = parseEntryPrice(entry);
+  if (!entryPrice) {
+    await safeSend(chatId, "Entry price must be a number. Example: /alert RELIANCE 2950");
+    return;
+  }
+
+  try {
+    const { ad, notified } = await createAndSendManualAlert(stock, entryPrice);
+    await safeSend(chatId,
+      "Manual alert sent!\n\n" +
+      "Stock: " + ad.stock_name + "\n" +
+      "Entry: Rs " + Number(ad.entry_price).toLocaleString("en-IN") + "\n" +
+      "Target: Rs " + Number(ad.target_price).toLocaleString("en-IN") + "\n" +
+      "SL: Rs " + Number(ad.sl_price).toLocaleString("en-IN") + "\n" +
+      "Users notified: " + notified);
+  } catch (err) {
+    console.log("/alert err:", err.message);
+    await safeSend(chatId, "Alert failed: " + err.message);
+  }
 });
 
 bot.onText(/\/link (.+)/, async (msg, match) => {
@@ -399,9 +529,10 @@ app.get("/api/send-alert", async (req, res) => {
   const{stock,entry,key}=req.query;
   if(key!==ADMIN_KEY)return res.send("<h2>Wrong key</h2>");
   if(!stock||!entry)return res.send("<html><body style='font-family:sans-serif;padding:40px;max-width:500px;margin:0 auto;background:#111;color:#eee'><h2>📤 Send Alert</h2><form method='GET'><input type='hidden' name='key' value='"+key+"'><p>Stock:</p><input name='stock' style='padding:10px;width:100%;border-radius:8px;border:1px solid #333;background:#222;color:#eee' required><p>Entry ₹:</p><input name='entry' type='number' step='0.01' style='padding:10px;width:100%;border-radius:8px;border:1px solid #333;background:#222;color:#eee' required><br><br><button style='padding:14px;width:100%;background:#00e89d;color:#000;border:none;border-radius:8px;font-weight:bold;font-size:16px;cursor:pointer'>Send</button></form></body></html>");
-  const ep=parseFloat(entry),ad={stock_name:stock.toUpperCase(),entry_price:ep,target_price:Math.round(ep*1.3*100)/100,sl_price:Math.round(ep*0.85*100)/100};
-  if(dbOk)await supabase.from("alerts_log").insert({...ad,strategy:"52-Week High Breakout"});
-  const n=await sendAlertToUsers(ad);
+  const ep=parseEntryPrice(entry);
+  if(!ep)return res.send("<h2>Entry price must be a number</h2>");
+  const { ad, notified } = await createAndSendManualAlert(stock, ep);
+  const n=notified;
   res.send("<html><body style='font-family:sans-serif;padding:40px;background:#111;color:#eee'><h2>✅ Sent!</h2><p>"+ad.stock_name+" → "+n+" users</p><a href='/api/send-alert?key="+key+"' style='color:#00e89d'>Send Another</a></body></html>");
 });
 
